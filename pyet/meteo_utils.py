@@ -2,7 +2,7 @@
 
 """
 
-from numpy import arccos, clip, cos, exp, isnan, log, nanmax, pi, sin, tan, where
+from numpy import arccos, arcsin, clip, cos, exp, isnan, log, nanmax, pi, sin, tan, where
 from pandas import Series, to_numeric
 from xarray import DataArray
 
@@ -44,6 +44,39 @@ def calc_psy(pressure, tmean=None):
         return CP * pressure / (0.622 * lambd)
 
 
+def adjust_wind(wind, zw=None, etype="os"):
+    """Adjusted wind to 2m height [m/s].
+
+    Parameters
+    ----------
+    wind: float or pandas.Series or xarray.DataArray, optional
+        mean day wind speed [m/s].
+    zw: float, optional
+        average day temperature [m].
+    etype: str, optional
+        "os" => ASCE-PM method is applied for a reference surfaces representing
+        clipped grass (a short, smooth crop). "rs" => ASCE-PM method is applied for a
+        reference surfaces representing alfalfa (a taller, rougher agricultural crop).
+
+    Returns
+    -------
+        array_like containing the Psychrometric
+        constant [kPa °C-1].
+
+    Notes
+    -----
+    From ACSE Appendix B
+
+    """
+    if zw is None:
+        return wind
+    else:
+        if etype == "os":
+            return wind * 4.87 / log(67.8 * zw - 5.42)
+        if etype == "rs":
+            return wind * 3.44 / log(16.3 * zw - 5.42)
+
+
 def calc_vpc(tmean):
     """Slope of saturation vapour pressure curve at air Temperature [kPa °C-1].
 
@@ -67,7 +100,7 @@ def calc_vpc(tmean):
 
     """
     es = calc_e0(tmean)
-    return 4098 * es / (tmean + 237.3) ** 2
+    return 4097.904 * es / (tmean + 237.3) ** 2
 
 
 def calc_lambda(tmean):
@@ -157,6 +190,62 @@ def calc_rho(pressure, tmean, ea):
     # Virtual temperature [tkv]
     tkv = (273.16 + tmean) * (1 - 0.378 * ea / pressure) ** -1
     return 3.486 * pressure / tkv
+
+
+def calc_g(rn, etype="os"):
+    """Soil heat flux density [MJ m-2 h-1] hourly
+
+    Parameters
+    ----------
+    rn: float or pandas.Series or xarray.DataArray
+        net radiation [MJ m-2 h-1].
+    etype: str, optional
+        "os" => ASCE-PM method is applied for a reference surfaces representing
+        clipped grass (a short, smooth crop). "rs" => ASCE-PM method is applied for a
+        reference surfaces representing alfalfa (a taller, rougher agricultural crop).
+
+    Returns
+    -------
+    array_like containing the calculated hourly soil heat density 
+    [MJ/m2h]
+
+    Notes
+    -----
+    Based on equation 65 in ASCE.
+
+    """
+    if etype == "os":
+        return where((rn > 0), 0.1 * rn, 0.5 * rn)
+    if etype == "rs":
+        return where((rn > 0), 0.04 * rn, 0.2 * rn)
+
+
+def calc_cd(rn, etype="os"):
+    """denominator constant, hourly
+
+    Parameters
+    ----------
+    rn: float or pandas.Series or xarray.DataArray
+        net radiation [MJ m-2 h-1].
+    etype: str, optional
+        "os" => ASCE-PM method is applied for a reference surfaces representing
+        clipped grass (a short, smooth crop). "rs" => ASCE-PM method is applied for a
+        reference surfaces representing alfalfa (a taller, rougher agricultural crop).
+
+    Returns
+    -------
+    array_like containing the calculated denominator constant
+    [s m-1]
+
+    Notes
+    -----
+    Based on Table 1 in ASCE.
+
+    """
+    if etype == "os":
+        return where((rn > 0), 0.24, 0.96)
+    if etype == "rs":
+        return where((rn > 0), 0.25, 1.7)
 
 
 def calc_e0(tmean):
@@ -262,6 +351,7 @@ def calc_ea(tmean=None, tmax=None, tmin=None, rhmax=None, rhmin=None, rh=None, e
         if tmax is not None:
             es = calc_es(tmax=tmax, tmin=tmin)
         else:
+            # Hourly case
             es = calc_e0(tmean)
         return rh / 100 * es
 
@@ -327,6 +417,99 @@ def sunset_angle(sol_dec, lat):
         return arccos(clip(-tan(sol_dec) * tan(lat), -1, 1))
 
 
+def sun_angle_mid(lat, sol_dec, sta):
+    """Angle of the sun above the horizon at the midpoint of the hourly
+    time period - hourly [rad]
+    
+    Parameters
+    ----------
+    lat: float or array_like
+        Latitude [rad]
+    sol_dec: float or array_like
+        Solar declination [rad]
+    sta: array_like
+        Solar time angle at the midpoint of the period [rad]
+    
+    Returns
+    -------
+    Time series with the angle of the sun above the horizon at the midpoint 
+    of the hourly or shorter time period.
+    """
+    beta = arcsin(sin(lat) * sin(sol_dec) + cos(lat) * cos(sol_dec) * cos(sta))
+    return beta
+
+
+def solar_times(sol_dec=None, lat=None, w=None, t=1):
+    """The solar time angles at the beginning and end of each
+    period - hourly [rad]
+    
+    Parameters
+    ----------
+    sol_dec: array_like
+        solar declination [rad].
+    lat: float or array_like
+        Latitude [rad]
+    w: array_like
+        Solar time angle at the midpoint of the period [rad]
+    t: array_like
+        Length of the calculation period [hours]
+    
+    Returns
+    -------
+    array_like containing the solar time angles at the beginning or end 
+    of each period
+    """
+    ws = sunset_angle(sol_dec, lat)
+    w1 = w - ((pi * t) / 24)
+    w2 = w + ((pi * t) / 24)
+
+    w1 = where(w1 < -ws, -ws, w1)
+    w2 = where(w2 < -ws, -ws, w2)
+    w1 = where(w1 > ws, ws, w1)
+    w2 = where(w2 > ws, ws, w2)
+    w1 = where(w1 > w2, w2, w1)
+    return w1, w2
+
+
+def solar_time_mid_angle(tindex, lon, j=None, lz=90):
+    """Solar time angle at the midpoint of the period - [rad]
+
+    Parameters
+    ----------
+    tindex: pandas.DatetimeIndex
+        Standard clock timestamp at the midpoint of the hour after 
+        correcting for any daylight savings shift.
+    lon: float or array_like
+        Longitude of the solar radiation measurement site expressed as
+        positive degrees west of Greenwich, England [deg]
+    j: array_like
+        day of the year (1-365).
+    lz: float or array_like
+        Longitude of the center of the local time zone expressed as
+        positive degrees west of Greenwich, England. [deg]
+
+    Returns
+    -------
+    array_like containing the calculated solar time angle at the midpoint 
+    of the period - daily [rad].
+
+    Notes
+    -----
+    Based on equations 55 in ASCE.
+
+    """
+    if j is None:
+        j = day_of_year(tindex)
+    b = (2 * pi * (j - 81)) / 364
+    sc = 0.1645 * sin(2 * b) - 0.1255 * cos(b) - 0.025 * sin(b)
+
+    hour = Series(to_numeric(tindex.strftime("%H")), tindex, dtype=int)
+    minute = Series(to_numeric(tindex.strftime("%M")), tindex, dtype=int)
+    t = hour + minute / 60 - 0.5
+    sta = (pi / 12) * ((t + 0.06667 * (lz - lon) + sc) - 12)
+    return sta
+
+
 def daylight_hours(tindex, lat):
     """Daylight hours [hour].
 
@@ -377,7 +560,7 @@ def relative_distance(j):
     return 1 + 0.033 * cos(2.0 * pi / 365.0 * j)
 
 
-def extraterrestrial_r(tindex, lat):
+def extraterrestrial_r(tindex=None, lat=None, lon=None, lz=90, period="daily"):
     """
     Extraterrestrial daily radiation [MJ m-2 d-1].
 
@@ -386,6 +569,14 @@ def extraterrestrial_r(tindex, lat):
     tindex: pandas.DatetimeIndex
     lat: array_like
         the site latitude [rad].
+    lon: float, array_like, optional
+        the site longitude [decimal].
+    lz: float or array_like, optional
+        Longitude of the center of the local time zone expressed as
+        positive degrees west of Greenwich, England. [deg]
+    period: str, optional
+        "daily" => ASCE-PM method is applied for daily time steps. "hourly" => ASCE-PM
+        method is applied for hourly time steps.
 
     Returns
     -------
@@ -400,16 +591,23 @@ def extraterrestrial_r(tindex, lat):
     dr = relative_distance(j)
     sol_dec = solar_declination(j)
 
-    omega = sunset_angle(sol_dec, lat)
-    if isinstance(lat, DataArray):
-        lat = lat.expand_dims(dim={"time": sol_dec.index}, axis=0)
-        xx = sin(sol_dec.values) * sin(lat.T)
-        yy = cos(sol_dec.values) * cos(lat.T)
-        return (118.08 / 3.141592654 * dr.values * (omega.T * xx + yy * sin(omega.T))).T
-    else:
+    if period == "daily":
+        omega = sunset_angle(sol_dec, lat)
+        if isinstance(lat, DataArray):
+            lat = lat.expand_dims(dim={"time": sol_dec.index}, axis=0)
+            xx = sin(sol_dec.values) * sin(lat.T)
+            yy = cos(sol_dec.values) * cos(lat.T)
+            return (118.08 / 3.141592654 * dr.values * (omega.T * xx + yy * sin(omega.T))).T
+        else:
+            xx = sin(sol_dec) * sin(lat)
+            yy = cos(sol_dec) * cos(lat)
+            return 118.08 / 3.141592654 * dr * (omega * xx + yy * sin(omega))
+    elif period == "hourly":
+        sta = solar_time_mid_angle(tindex, lon, lz=lz)
+        omega1, omega2 = solar_times(sol_dec, lat, sta)
         xx = sin(sol_dec) * sin(lat)
         yy = cos(sol_dec) * cos(lat)
-        return 118.08 / 3.141592654 * dr * (omega * xx + yy * sin(omega))
+        return 12 / pi * 4.92 * dr.values * ((omega2 - omega1) * xx + yy * (sin(omega2) - sin(omega1)))
 
 
 def calc_res_surf(

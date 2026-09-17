@@ -14,9 +14,12 @@ from .meteo_utils import (
     calc_ea,
     calc_es,
     calc_rho,
+    calc_g,
+    calc_cd,
     calc_res_surf,
     calc_res_aero,
     day_of_year,
+    adjust_wind,
 )
 from .radiation import (
     jensen_haise,
@@ -191,8 +194,11 @@ def pm_asce(
     rhmin=None,
     rh=None,
     pressure=None,
+    zw=None,
     elevation=None,
     lat=None,
+    lon=None,
+    lz=None,
     n=None,
     nn=None,
     rso=None,
@@ -207,6 +213,7 @@ def pm_asce(
     bs1=0.5,
     clip_zero=True,
     etype="os",
+    period="daily"
 ):
     """Potential evapotranspiration calculated according to
     :cite:t:`monteith_evaporation_1965`.
@@ -218,11 +225,11 @@ def pm_asce(
     wind: float or pandas.Series or xarray.DataArray
         mean day wind speed [m/s].
     rs: float or pandas.Series or xarray.DataArray, optional
-        incoming solar radiation [MJ m-2 d-1].
+        incoming solar radiation [MJ m-2 d-1], [MJ m-2 h-1].
     rn: float or pandas.Series or xarray.DataArray, optional
         net radiation [MJ m-2 d-1].
     g: float or pandas.Series or xarray.DataArray, optional
-        soil heat flux [MJ m-2 d-1].
+        soil heat flux [MJ m-2 d-1], [MJ m-2 h-1].
     tmax: float or pandas.Series or xarray.DataArray, optional
         maximum day temperature [°C].
     tmin: float or pandas.Series or xarray.DataArray, optional
@@ -235,10 +242,17 @@ def pm_asce(
         mean daily relative humidity [%].
     pressure: float or xarray.DataArray, optional
         atmospheric pressure [kPa].
+    zw: float, optional
+        height of wind measurement above ground surface [m].
     elevation: float or xarray.DataArray, optional
         the site elevation [m].
     lat: float or xarray.DataArray, optional
         the site latitude [rad].
+    lon: float or xarray.DataArray, optional
+        the site longitude [degree].
+    lz: float or array_like
+        Longitude of the center of the local time zone expressed as
+        positive degrees west of Greenwich, England. [deg]
     n: float or pandas.Series or xarray.DataArray, optional
         actual duration of sunshine [hour].
     nn: float or pandas.Series or xarray.DataArray, optional
@@ -270,6 +284,9 @@ def pm_asce(
         "os" => ASCE-PM method is applied for a reference surfaces representing
         clipped grass (a short, smooth crop). "rs" => ASCE-PM method is applied for a
         reference surfaces representing alfalfa (a taller, rougher agricultural crop),).
+    period: str, optional
+        "daily" => ASCE-PM method is applied for daily time steps. "hourly" => ASCE-PM
+        method is applied for hourly time steps.
 
     Returns
     -------
@@ -288,6 +305,7 @@ def pm_asce(
         \\frac{e_s-e_a}{r_a}}{\\lambda(\\Delta +\\gamma(1+\\frac{r_s}{r_a}))}
 
     """
+    wind = adjust_wind(wind, zw, etype)
     pressure, gamma, dlt, lambd, ea, es = _lambda_gamma_dlt_ea_es(
         elevation, pressure, tmean, tmax, tmin, rhmax, rhmin, rh, ea
     )
@@ -296,6 +314,8 @@ def pm_asce(
         rn,
         rs,
         lat,
+        lon,
+        lz,
         n,
         nn,
         tmax,
@@ -312,10 +332,19 @@ def pm_asce(
         as1,
         bs1,
         kab,
+        period,
     )
-    if etype == "rs":
+    if etype == "rs" and period == "daily":
         cn = 1600
         cd = 0.38
+    if period == "hourly":
+        cd = calc_cd(rn, etype=etype)
+        if etype == "os":
+            cn = 37
+        if etype == "rs":
+            cn = 66
+    if g is None:
+        g = calc_g(rn, etype=etype)
 
     den = dlt + gamma * (1 + cd * wind)
     num1 = (0.408 * dlt * (rn - g)) / den
@@ -1211,7 +1240,7 @@ def calculate_all(
 def _lambda_gamma_dlt_ea_es(
     velevation, vpressure, vtmean, vtmax, vtmin, vrhmax, vrhmin, vrh, vea
 ):
-    """Just ot avoid duplicated rows."""
+    """Just to avoid duplicated rows."""
     vpressure = calc_press(velevation, vpressure)
     gamma = calc_psy(vpressure)
     dlt = calc_vpc(vtmean)
